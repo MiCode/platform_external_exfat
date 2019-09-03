@@ -3,7 +3,7 @@
 	exFAT file system implementation library.
 
 	Free exFAT implementation.
-	Copyright (C) 2010-2017  Andrew Nayenko
+	Copyright (C) 2010-2018  Andrew Nayenko
 
 	This program is free software; you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -204,10 +204,13 @@ static bool check_entries(const struct exfat_entry* entry, int n)
 	return true;
 }
 
-static bool check_node(const struct exfat_node* node, le16_t actual_checksum,
-		int cluster_size, const struct exfat_entry_meta1* meta1,
+static bool check_node(const struct exfat* ef, struct exfat_node* node,
+		le16_t actual_checksum, const struct exfat_entry_meta1* meta1,
 		const struct exfat_entry_meta2* meta2)
 {
+	int cluster_size = CLUSTER_SIZE(*ef->sb);
+	uint64_t clusters_heap_size =
+			(uint64_t) le32_to_cpu(ef->sb->cluster_count) * cluster_size;
 	char buffer[EXFAT_UTF8_NAME_BUFFER_MAX];
 	bool ret = true;
 
@@ -220,7 +223,8 @@ static bool check_node(const struct exfat_node* node, le16_t actual_checksum,
 		exfat_get_name(node, buffer);
 		exfat_error("'%s' has invalid checksum (%#hx != %#hx)", buffer,
 				le16_to_cpu(actual_checksum), le16_to_cpu(meta1->checksum));
-		ret = false;
+		if (!EXFAT_REPAIR(invalid_node_checksum, ef, node))
+			ret = false;
 	}
 
 	/*
@@ -251,11 +255,20 @@ static bool check_node(const struct exfat_node* node, le16_t actual_checksum,
 				node->start_cluster);
 		ret = false;
 	}
-	if (node->size > 0 && CLUSTER_INVALID(node->start_cluster))
+	if (node->size > 0 && CLUSTER_INVALID(*ef->sb, node->start_cluster))
 	{
 		exfat_get_name(node, buffer);
 		exfat_error("'%s' points to invalid cluster %#x", buffer,
 				node->start_cluster);
+		ret = false;
+	}
+
+	/* File or directory cannot be larger than clusters heap. */
+	if (node->size > clusters_heap_size)
+	{
+		exfat_get_name(node, buffer);
+		exfat_error("'%s' is larger than clusters heap: %"PRIu64" > %"PRIu64,
+				buffer, node->size, clusters_heap_size);
 		ret = false;
 	}
 
@@ -280,8 +293,8 @@ static bool check_node(const struct exfat_node* node, le16_t actual_checksum,
 	return ret;
 }
 
-static int parse_file_entries(struct exfat* ef, struct exfat_node* parent,
-		struct exfat_node* node, const struct exfat_entry* entries, int n)
+static int parse_file_entries(struct exfat* ef, struct exfat_node* node,
+		const struct exfat_entry* entries, int n)
 {
 	const struct exfat_entry_meta1* meta1;
 	const struct exfat_entry_meta2* meta2;
@@ -314,8 +327,7 @@ static int parse_file_entries(struct exfat* ef, struct exfat_node* parent,
 	init_node_meta2(node, meta2);
 	init_node_name(node, entries + 2, mandatory_entries - 2);
 
-	if (!check_node(node, exfat_calc_checksum(entries, n),
-			CLUSTER_SIZE(*ef->sb), meta1, meta2))
+	if (!check_node(ef, node, exfat_calc_checksum(entries, n), meta1, meta2))
 		return -EIO;
 
 	return 0;
@@ -337,7 +349,7 @@ static int parse_file_entry(struct exfat* ef, struct exfat_node* parent,
 		return -ENOMEM;
 	(*node)->entry_offset = *offset;
 
-	rc = parse_file_entries(ef, parent, *node, entries, n);
+	rc = parse_file_entries(ef, *node, entries, n);
 	if (rc != 0)
 	{
 		free(*node);
@@ -401,7 +413,7 @@ static int readdir(struct exfat* ef, struct exfat_node* parent,
 			if (ef->upcase != NULL)
 				break;
 			upcase = (const struct exfat_entry_upcase*) &entry;
-			if (CLUSTER_INVALID(le32_to_cpu(upcase->start_cluster)))
+			if (CLUSTER_INVALID(*ef->sb, le32_to_cpu(upcase->start_cluster)))
 			{
 				exfat_error("invalid cluster 0x%x in upcase table",
 						le32_to_cpu(upcase->start_cluster));
@@ -452,14 +464,13 @@ static int readdir(struct exfat* ef, struct exfat_node* parent,
 		case EXFAT_ENTRY_BITMAP:
 			bitmap = (const struct exfat_entry_bitmap*) &entry;
 			ef->cmap.start_cluster = le32_to_cpu(bitmap->start_cluster);
-			if (CLUSTER_INVALID(ef->cmap.start_cluster))
+			if (CLUSTER_INVALID(*ef->sb, ef->cmap.start_cluster))
 			{
 				exfat_error("invalid cluster 0x%x in clusters bitmap",
 						ef->cmap.start_cluster);
 				return -EIO;
 			}
-			ef->cmap.size = le32_to_cpu(ef->sb->cluster_count) -
-				EXFAT_FIRST_DATA_CLUSTER;
+			ef->cmap.size = le32_to_cpu(ef->sb->cluster_count);
 			if (le64_to_cpu(bitmap->size) < DIV_ROUND_UP(ef->cmap.size, 8))
 			{
 				exfat_error("invalid clusters bitmap size: %"PRIu64
@@ -496,7 +507,7 @@ static int readdir(struct exfat* ef, struct exfat_node* parent,
 				exfat_error("too long label (%hhu chars)", label->length);
 				return -EIO;
 			}
-			if (utf16_to_utf8(ef->label, label->name,
+			if (exfat_utf16_to_utf8(ef->label, label->name,
 						sizeof(ef->label), EXFAT_ENAME_MAX) != 0)
 				return -EIO;
 			break;
@@ -506,7 +517,8 @@ static int readdir(struct exfat* ef, struct exfat_node* parent,
 				break; /* deleted entry, ignore it */
 
 			exfat_error("unknown entry type %#hhx", entry.type);
-			return -EIO;
+			if (!EXFAT_REPAIR(unknown_entry, ef, parent, &entry, *offset))
+				return -EIO;
 		}
 		*offset += sizeof(entry);
 	}
@@ -845,7 +857,8 @@ static int find_slot(struct exfat* ef, struct exfat_node* dir,
 					free(dmap);
 					return -EIO;
 				case -EINVAL:
-					/* slot is occupied, continue searching */
+					/* slot at (i-n) is occupied, go back and check (i-n+1) */
+					i -= contiguous - 1;
 					contiguous = 0;
 					break;
 				}
@@ -865,7 +878,7 @@ static int find_slot(struct exfat* ef, struct exfat_node* dir,
 }
 
 static int commit_entry(struct exfat* ef, struct exfat_node* dir,
-		const le16_t* name, cluster_t cluster, off_t offset, uint16_t attrib)
+		const le16_t* name, off_t offset, uint16_t attrib)
 {
 	struct exfat_node* node;
 	const size_t name_length = utf16_length(name);
@@ -925,7 +938,6 @@ static int create(struct exfat* ef, const char* path, uint16_t attrib)
 {
 	struct exfat_node* dir;
 	struct exfat_node* existing;
-	cluster_t cluster = EXFAT_CLUSTER_BAD;
 	off_t offset = -1;
 	le16_t name[EXFAT_NAME_MAX + 1];
 	int rc;
@@ -947,7 +959,7 @@ static int create(struct exfat* ef, const char* path, uint16_t attrib)
 		exfat_put_node(ef, dir);
 		return rc;
 	}
-	rc = commit_entry(ef, dir, name, cluster, offset, attrib);
+	rc = commit_entry(ef, dir, name, offset, attrib);
 	if (rc != 0)
 	{
 		exfat_put_node(ef, dir);
@@ -995,8 +1007,7 @@ int exfat_mkdir(struct exfat* ef, const char* path)
 }
 
 static int rename_entry(struct exfat* ef, struct exfat_node* dir,
-		struct exfat_node* node, const le16_t* name, cluster_t new_cluster,
-		off_t new_offset)
+		struct exfat_node* node, const le16_t* name, off_t new_offset)
 {
 	const size_t name_length = utf16_length(name);
 	const int name_entries = DIV_ROUND_UP(name_length, EXFAT_ENAME_MAX);
@@ -1048,7 +1059,6 @@ int exfat_rename(struct exfat* ef, const char* old_path, const char* new_path)
 	struct exfat_node* node;
 	struct exfat_node* existing;
 	struct exfat_node* dir;
-	cluster_t cluster = EXFAT_CLUSTER_BAD;
 	off_t offset = -1;
 	le16_t name[EXFAT_NAME_MAX + 1];
 	int rc;
@@ -1129,7 +1139,7 @@ int exfat_rename(struct exfat* ef, const char* old_path, const char* new_path)
 		exfat_put_node(ef, node);
 		return rc;
 	}
-	rc = rename_entry(ef, dir, node, name, cluster, offset);
+	rc = rename_entry(ef, dir, node, name, offset);
 	if (rc != 0)
 	{
 		exfat_put_node(ef, dir);
@@ -1191,7 +1201,7 @@ int exfat_set_label(struct exfat* ef, const char* label)
 	struct exfat_entry_label entry;
 
 	memset(label_utf16, 0, sizeof(label_utf16));
-	rc = utf8_to_utf16(label_utf16, label, EXFAT_ENAME_MAX + 1, strlen(label));
+	rc = exfat_utf8_to_utf16(label_utf16, label, EXFAT_ENAME_MAX + 1, strlen(label));
 	if (rc != 0)
 		return rc;
 

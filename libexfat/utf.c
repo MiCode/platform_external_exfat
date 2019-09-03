@@ -3,7 +3,7 @@
 	exFAT file system implementation library.
 
 	Free exFAT implementation.
-	Copyright (C) 2010-2017  Andrew Nayenko
+	Copyright (C) 2010-2018  Andrew Nayenko
 
 	This program is free software; you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -101,7 +101,7 @@ static const le16_t* utf16_to_wchar(const le16_t* input, wchar_t* wc,
 	}
 }
 
-int utf16_to_utf8(char* output, const le16_t* input, size_t outsize,
+int exfat_utf16_to_utf8(char* output, const le16_t* input, size_t outsize,
 		size_t insize)
 {
 	const le16_t* inp = input;
@@ -202,7 +202,7 @@ static le16_t* wchar_to_utf16(le16_t* output, wchar_t wc, size_t outsize)
 	return output + 2;
 }
 
-int utf8_to_utf16(le16_t* output, const char* input, size_t outsize,
+int exfat_utf8_to_utf16(le16_t* output, const char* input, size_t outsize,
 		size_t insize)
 {
 	const char* inp = input;
